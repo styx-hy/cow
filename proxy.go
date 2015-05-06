@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"runtime/pprof"
 	"strings"
 	"sync"
 	"time"
@@ -429,7 +428,6 @@ func (c *clientConn) serve() {
 
 	defer func() {
 		r.releaseBuf()
-		pprof.Lookup("sv").Remove(sv.hostPort)
 		c.Close()
 	}()
 
@@ -514,7 +512,6 @@ func (c *clientConn) serve() {
 			}
 			return
 		}
-		pprof.Lookup("sv").Add(sv.hostPort, 0)
 
 		if r.isConnect {
 			// server connection will be closed in doConnect
@@ -641,9 +638,11 @@ func (c *clientConn) readResponse(sv *serverConn, r *Request, rp *Response) (err
 		}
 	*/
 
+	sv.setReadTimeout("srv->cli")
 	if err = parseResponse(sv, r, rp); err != nil {
 		return c.handleServerReadError(r, sv, err, "parse response")
 	}
+	sv.unsetReadTimeout("srv->cli")
 	dbgPrintRep(c, r, rp)
 	// After have received the first reponses from the server, we consider
 	// ther server as real instead of fake one caused by wrong DNS reply. So

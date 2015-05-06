@@ -67,7 +67,7 @@ func main() {
 		runtime.GOMAXPROCS(config.Core)
 	}
 
-	svprof := pprof.NewProfile("sv")
+	pprof.NewProfile("sv")
 
 	go sigHandler()
 	go runSSH()
