@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/pprof"
 	// "runtime/pprof"
 	"sync"
 	"syscall"
@@ -65,6 +66,8 @@ func main() {
 	if config.Core > 0 {
 		runtime.GOMAXPROCS(config.Core)
 	}
+
+	svprof := pprof.NewProfile("sv")
 
 	go sigHandler()
 	go runSSH()

@@ -4,14 +4,16 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/cyfdecyf/bufio"
-	"github.com/cyfdecyf/leakybuf"
-	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 	"io"
 	"net"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/cyfdecyf/bufio"
+	"github.com/cyfdecyf/leakybuf"
+	ss "github.com/shadowsocks/shadowsocks-go/shadowsocks"
 )
 
 // As I'm using ReadSlice to read line, it's possible to get
@@ -427,6 +429,7 @@ func (c *clientConn) serve() {
 
 	defer func() {
 		r.releaseBuf()
+		pprof.Lookup("sv").Remove(sv.hostPort)
 		c.Close()
 	}()
 
@@ -511,6 +514,7 @@ func (c *clientConn) serve() {
 			}
 			return
 		}
+		pprof.Lookup("sv").Add(sv.hostPort, 0)
 
 		if r.isConnect {
 			// server connection will be closed in doConnect

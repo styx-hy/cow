@@ -49,14 +49,20 @@ func MonitorProfile(w gohttp.ResponseWriter, r *gohttp.Request) {
 	prof := pprof.Lookup("goroutine")
 	prof.WriteTo(w, 1)
 }
+
+func ConnectionProfile(w gohttp.ResponseWriter, r *gohttp.Request) {
+	prof := pprof.Lookup("sv")
+	prof.WriteTo(w, 1)
+}
 func monitor() {
-	go func() {
-		log.Println(gohttp.ListenAndServe("localhost:6060", nil))
-	}()
+	// go func() {
+	// log.Println(gohttp.ListenAndServe("localhost:6060", nil))
+	// }()
 	router := mux.NewRouter().StrictSlash(true)
 	router.HandleFunc("/", Index)
 	router.HandleFunc("/numgoroutine", CountGoRoutine)
 	router.HandleFunc("/profile", MonitorProfile)
+	router.HandleFunc("/sv", ConnectionProfile)
 	router.HandleFunc("/todos", TodoIndex)
 	router.HandleFunc("/todos/{todoID}", TodoShow)
 	log.Fatal(gohttp.ListenAndServe(":8088", router))
