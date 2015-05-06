@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"html"
 	"log"
-	gohttp "net/http"
+	gohttp "net/http" // conflict with http variable in config.go
+	_ "net/http/pprof"
+	"runtime"
+	"runtime/pprof"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -38,10 +41,23 @@ func TodoShow(w gohttp.ResponseWriter, r *gohttp.Request) {
 	fmt.Fprintf(w, "Todo show:", todoID)
 }
 
+func CountGoRoutine(w gohttp.ResponseWriter, r *gohttp.Request) {
+	fmt.Fprintf(w, "%d", runtime.NumGoroutine())
+}
+
+func MonitorProfile(w gohttp.ResponseWriter, r *gohttp.Request) {
+	prof := pprof.Lookup("goroutine")
+	prof.WriteTo(w, 1)
+}
 func monitor() {
+	go func() {
+		log.Println(gohttp.ListenAndServe("localhost:6060", nil))
+	}()
 	router := mux.NewRouter().StrictSlash(true)
 	router.HandleFunc("/", Index)
+	router.HandleFunc("/numgoroutine", CountGoRoutine)
+	router.HandleFunc("/profile", MonitorProfile)
 	router.HandleFunc("/todos", TodoIndex)
 	router.HandleFunc("/todos/{todoID}", TodoShow)
-	log.Fatal(gohttp.ListenAndServe(":8080", router))
+	log.Fatal(gohttp.ListenAndServe(":8088", router))
 }
