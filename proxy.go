@@ -90,6 +90,14 @@ type serverConn struct {
 	willCloseOn time.Time
 	siteInfo    *VisitCnt
 	visited     bool
+	invalid     bool
+}
+
+type reqDuetMsg struct {
+	reqCh    chan *Request
+	reqChCtl chan int
+	reqChErr chan error
+	block    chan int
 }
 
 type clientConn struct {
@@ -97,6 +105,7 @@ type clientConn struct {
 	bufRd    *bufio.Reader
 	buf      []byte // buffer for the buffered reader
 	proxy    Proxy
+	rduet    reqDuetMsg
 	duet     chan int
 }
 
@@ -262,6 +271,11 @@ func newClientConn(cli net.Conn, proxy Proxy) *clientConn {
 		bufRd: bufio.NewReaderFromBuf(cli, buf),
 		proxy: proxy,
 		duet:  make(chan int, 1),
+		rduet: reqDuetMsg{
+			reqCh:    make(chan *Request, 1),
+			reqChCtl: make(chan int, 1),
+			reqChErr: make(chan error, 1),
+		},
 	}
 	if debug {
 		debug.Printf("cli(%s) connected, total %d clients\n",
@@ -446,36 +460,50 @@ const (
 // Overlap request fetching with other processing
 //
 // XXX A better way is to buffer received requests? But consider CONNECT!!!
-func (c *clientConn) parseRequestDuet(reqCh chan<- *Request, reqChCtl <-chan int, reqChErr chan<- error) {
+func (c *clientConn) parseRequestDuet() {
+	if debug {
+		debug.Printf("duet cli(%s) enter\n", c.RemoteAddr())
+	}
 	for {
 		req := new(Request)
 
 		// started by clientConn.serve(), always poll the first request
 		if err := parseRequest(c, req); err != nil {
-			reqChErr <- err
-			reqCh <- nil
+			c.rduet.reqChErr <- err
+			c.rduet.reqCh <- nil
 			if err == io.EOF {
 				// send the message here because coordinator may block
-				errl.Printf("duet cli(%s) ----------------------- kill\n", c.RemoteAddr())
+				if debug {
+					debug.Printf("duet cli(%s) kill\n", c.RemoteAddr())
+				}
 				c.duet <- 1
 			}
 		} else {
 			// OK, a good request
-			reqChErr <- nil
-			reqCh <- req
+			c.rduet.reqChErr <- nil
+			c.rduet.reqCh <- req
 		}
 
 		// block to receive the command of coordinator goroutine
-		cmd := <-reqChCtl
+		if debug {
+			debug.Printf("duet cli(%s) block\n", c.RemoteAddr())
+		}
+		cmd := <-c.rduet.reqChCtl
 
 		switch cmd {
 		case duetContinue:
 			// continue to poll another request
+			if debug {
+				debug.Printf("duet cli(%s) continue\n", c.RemoteAddr())
+			}
 			continue
 		case duetAbort:
 			// finish this connection handling
 			// a) An error occurs
 			// b) CONNECT request always closes the connection
+			if debug {
+				debug.Printf("parseRequestDuet cli(%s) exits\n", c.RemoteAddr())
+			}
 			return
 		default:
 		}
@@ -499,11 +527,7 @@ func (c *clientConn) serve() {
 		c.Close()
 	}()
 
-	// buffer at most one message
-	reqCh := make(chan *Request, 1)
-	reqChCtl := make(chan int, 1)
-	reqChErr := make(chan error, 1)
-	go c.parseRequestDuet(reqCh, reqChCtl, reqChErr)
+	go c.parseRequestDuet()
 
 	// Refer to implementation.md for the design choices on parsing the request
 	// and response.
@@ -513,11 +537,11 @@ func (c *clientConn) serve() {
 		}
 
 		// the channel read should complete in bounded time due to the deadline
-		req := <-reqCh
-		err = <-reqChErr
+		req := <-c.rduet.reqCh
+		err = <-c.rduet.reqChErr
 		if req == nil && err != nil {
 			// stop processing this connection
-			reqChCtl <- duetAbort
+			c.rduet.reqChCtl <- duetAbort
 
 			debug.Printf("cli(%s) parse request %v\n", c.RemoteAddr(), err)
 			if err == io.EOF || isErrConnReset(err) {
@@ -571,9 +595,9 @@ func (c *clientConn) serve() {
 
 		if r.isConnect {
 			// block client side handling until CONNECT is done
-			reqChCtl <- duetAbort
+			c.rduet.reqChCtl <- duetAbort
 		} else {
-			reqChCtl <- duetContinue
+			c.rduet.reqChCtl <- duetContinue
 		}
 
 		if r.isConnect && !config.TunnelAllowedPort[r.URL.Port] {
@@ -754,6 +778,7 @@ func (c *clientConn) readResponse(sv *serverConn, r *Request, rp *Response) (err
 
 	go c.parseResponseDuet(sv, r, rp, done, rspChErr)
 
+resume:
 	select {
 	case <-done:
 		err = <-rspChErr
@@ -761,14 +786,27 @@ func (c *clientConn) readResponse(sv *serverConn, r *Request, rp *Response) (err
 			return c.handleServerReadError(r, sv, err, "parse response")
 		}
 	case <-c.duet:
-		errl.Printf("cli(%s) duet kill\n", c.RemoteAddr())
+		if debug {
+			debug.Printf("cli(%s) duet kill\n", c.RemoteAddr())
+		}
+		// Use invalid flag to prevent double close
+		sv.invalid = true
 		if debug {
 			debug.Printf("close connection to %s remains %d concurrent connections\n",
 				sv.hostPort, decSrvConnCnt(sv.hostPort))
 		}
 		sv.Conn.Close()
+		// wait for ReadSlice to return error
+		<-done
 		sv.releaseBuf()
 		return errors.New("killed by duet")
+	case <-c.rduet.reqCh:
+		// The rational here to check the channel is that if the server
+		// side is blocked, client side request should be discarded.
+		// XXX Maybe I should just buffer them
+		<-c.rduet.reqChErr
+		c.rduet.reqChCtl <- duetContinue
+		goto resume
 	}
 	// if err = parseResponse(sv, r, rp); err != nil {
 	// 	return c.handleServerReadError(r, sv, err, "parse response")
@@ -994,6 +1032,7 @@ func newServerConn(c net.Conn, hostPort string, siteInfo *VisitCnt) *serverConn 
 		Conn:     c,
 		hostPort: hostPort,
 		siteInfo: siteInfo,
+		invalid:  false,
 	}
 	return sv
 }
@@ -1032,11 +1071,15 @@ func (sv *serverConn) releaseBuf() {
 }
 
 func (sv *serverConn) Close() error {
+	if sv.invalid {
+		return nil
+	}
 	sv.releaseBuf()
 	if debug {
 		debug.Printf("close connection to %s remains %d concurrent connections\n",
 			sv.hostPort, decSrvConnCnt(sv.hostPort))
 	}
+	sv.invalid = true
 	return sv.Conn.Close()
 }
 
@@ -1468,14 +1511,14 @@ func sendBodyChunked(w io.Writer, r *bufio.Reader, rdSize int) (err error) {
 			errl.Println("chunk size invalid:", err)
 			return
 		}
-
-		if debug {
-			// To debug getting malformed response status line with "0\r\n".
-			if c, ok := w.(*clientConn); ok {
-				debug.Printf("cli(%s) chunk size %d %#v\n", c.RemoteAddr(), size, string(s))
+		/*
+			if debug {
+				// To debug getting malformed response status line with "0\r\n".
+				if c, ok := w.(*clientConn); ok {
+					debug.Printf("cli(%s) chunk size %d %#v\n", c.RemoteAddr(), size, string(s))
+				}
 			}
-		}
-
+		*/
 		if size == 0 {
 			r.Skip(len(s))
 			if err = skipCRLF(r); err != nil {
