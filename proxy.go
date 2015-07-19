@@ -436,95 +436,41 @@ func (s SinkWriter) Write(p []byte) (int, error) {
 }
 
 const maxBufferedRequest = 5
+const (
+	duetContinue = iota
+	duetAbort
+)
 
-// There are three cases:
-// 1. `parseRequest' timeouts.
-// 2. `parseRequest' returns other errors when the connection is closed by
-//    client browser. This should be asynchronous since the detection should
-//    continue when another goroutine is polling response from the server.
-// 3. `parseRequest' returns a valid request
+// Overlap request fetching with other processing
 //
-// XXX A better way is to buffer received requests
-func (c *clientConn) parseRequestDuet(reqCh chan<- *Request, reqChCtl <-chan int, reqChErr chan<- int) {
-	var expecting bool
-	var closed bool
-	reqBuf := make(chan *Request, maxBufferedRequest)
-
+// XXX A better way is to buffer received requests? But consider CONNECT!!!
+func (c *clientConn) parseRequestDuet(reqCh chan<- *Request, reqChCtl <-chan int, reqChErr chan<- error) {
 	for {
 		req := new(Request)
 
+		// started by clientConn.serve(), always poll the first request
 		if err := parseRequest(c, req); err != nil {
-			debug.Printf("cli(%s) parse request %v\n", c.RemoteAddr(), err)
-			if err == io.EOF || isErrConnReset(err) {
-				// case [2]:
-				// XXX should we return now?
-				reqCh <- nil
-				reqChErr <- 3
-				return
-			}
-			if err != errClientTimeout {
-				// case [2]:
-				// XXX it's odd, maybe client closes connection?
-				if expecting {
-					reqChErr <- 1
-				}
-				closed = true
-				// FIXME maybe it's time to close the server connection
-
-			} else {
-				// case [1]:
-				// maybe it's ok, since we keep on reading
-				// XXX But timeout for normal parse can be very long, I should
-				// reduce the timeout
-				if expecting {
-					// XXX but if there is a real request pending, we should report
-					// this error
-					// <2> for real timeout when main routine is expecting requests
-					reqChErr <- 2
-				}
-				// we just ignore it since we are just randomly detecting,
-				// timeouts doesn't matter
-			}
+			reqChErr <- err
+			reqCh <- nil
 		} else {
-			// case [3]:
 			// OK, a good request
-			// XXX What if it blocks?
-			select {
-			case reqBuf <- req:
-				debug.Printf("reqBuf put\n")
-			default:
-				// discard the request
-			}
+			reqChErr <- nil
+			reqCh <- req
 		}
 
-		select {
-		case <-reqChCtl:
-			// main routine is expecting a new request from client, over a
-			// one-time connection or persistent connection
-			// XXX corner cases
-			select {
-			case r := <-reqBuf:
-				reqCh <- r
-			default:
-				if closed {
-					reqCh <- nil
-					reqChErr <- 1
-					return
-				}
-				expecting = true
-			}
+		// block to receive the command of coordinator goroutine
+		cmd := <-reqChCtl
+
+		switch cmd {
+		case duetContinue:
+			// continue to poll another request
+			continue
+		case duetAbort:
+			// finish this connection handling
+			// a) An error occurs
+			// b) CONNECT request always closes the connection
+			return
 		default:
-			if expecting {
-				// not getting new expectations, but the flag is raised in
-				// previous round
-				select {
-				case r := <-reqBuf:
-					reqCh <- r
-				default:
-					// errors are already set
-					reqCh <- nil
-				}
-			}
 		}
 	}
 }
@@ -546,9 +492,10 @@ func (c *clientConn) serve() {
 		c.Close()
 	}()
 
-	reqCh := make(chan *Request)
-	reqChCtl := make(chan int)
-	reqChErr := make(chan int)
+	// buffer at most one message
+	reqCh := make(chan *Request, 1)
+	reqChCtl := make(chan int, 1)
+	reqChErr := make(chan error, 1)
 	go c.parseRequestDuet(reqCh, reqChCtl, reqChErr)
 
 	// Refer to implementation.md for the design choices on parsing the request
@@ -558,29 +505,13 @@ func (c *clientConn) serve() {
 			panic("client read buffer nil")
 		}
 
-		// raise flag to expect a request
-		reqChCtl <- 1
 		// the channel read should complete in bounded time due to the deadline
 		req := <-reqCh
-		if req == nil {
-			reqErr := <-reqChErr
-			if reqErr == 3 {
-				return
-			}
-			if reqErr == 2 {
-				sendErrorPage(c, statusRequestTimeout, statusRequestTimeout,
-					"Your browser didn't send a complete request in time.")
-				return
-			}
-			if reqErr == 1 {
-				// XXX need to stop the polling side at server
-				sendErrorPage(c, "404 Bad request", "Bad request", err.Error())
-				return
-			}
-		}
-		r = *req
+		err = <-reqChErr
+		if req == nil && err != nil {
+			// stop processing this connection
+			reqChCtl <- duetAbort
 
-		if err = parseRequest(c, &r); err != nil {
 			debug.Printf("cli(%s) parse request %v\n", c.RemoteAddr(), err)
 			if err == io.EOF || isErrConnReset(err) {
 				return
@@ -593,6 +524,21 @@ func (c *clientConn) serve() {
 				"Your browser didn't send a complete request in time.")
 			return
 		}
+		r = *req
+
+		// if err = parseRequest(c, &r); err != nil {
+		// 	debug.Printf("cli(%s) parse request %v\n", c.RemoteAddr(), err)
+		// 	if err == io.EOF || isErrConnReset(err) {
+		// 		return
+		// 	}
+		// 	if err != errClientTimeout {
+		// 		sendErrorPage(c, "404 Bad request", "Bad request", err.Error())
+		// 		return
+		// 	}
+		// 	sendErrorPage(c, statusRequestTimeout, statusRequestTimeout,
+		// 		"Your browser didn't send a complete request in time.")
+		// 	return
+		// }
 		dbgPrintRq(c, &r)
 
 		// PAC may leak frequently visited sites information. But if cow
@@ -614,6 +560,13 @@ func (c *clientConn) serve() {
 				return
 			}
 			authed = true
+		}
+
+		if r.isConnect {
+			// block client side handling until CONNECT is done
+			reqChCtl <- duetAbort
+		} else {
+			reqChCtl <- duetContinue
 		}
 
 		if r.isConnect && !config.TunnelAllowedPort[r.URL.Port] {
