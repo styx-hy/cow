@@ -97,6 +97,7 @@ type clientConn struct {
 	bufRd    *bufio.Reader
 	buf      []byte // buffer for the buffered reader
 	proxy    Proxy
+	duet     chan int
 }
 
 var (
@@ -260,6 +261,7 @@ func newClientConn(cli net.Conn, proxy Proxy) *clientConn {
 		buf:   buf,
 		bufRd: bufio.NewReaderFromBuf(cli, buf),
 		proxy: proxy,
+		duet:  make(chan int, 1),
 	}
 	if debug {
 		debug.Printf("cli(%s) connected, total %d clients\n",
@@ -452,6 +454,11 @@ func (c *clientConn) parseRequestDuet(reqCh chan<- *Request, reqChCtl <-chan int
 		if err := parseRequest(c, req); err != nil {
 			reqChErr <- err
 			reqCh <- nil
+			if err == io.EOF {
+				// send the message here because coordinator may block
+				errl.Printf("duet cli(%s) ----------------------- kill\n", c.RemoteAddr())
+				c.duet <- 1
+			}
 		} else {
 			// OK, a good request
 			reqChErr <- nil
@@ -714,6 +721,16 @@ func dbgPrintRep(c *clientConn, r *Request, rp *Response) {
 	}
 }
 
+func (c *clientConn) parseResponseDuet(sv *serverConn, r *Request, rp *Response, done chan<- int, rspChErr chan<- error) {
+	if err := parseResponse(sv, r, rp); err != nil {
+		done <- 0
+		rspChErr <- err
+		return
+	}
+	done <- 1
+	rspChErr <- nil
+}
+
 func (c *clientConn) readResponse(sv *serverConn, r *Request, rp *Response) (err error) {
 	sv.initBuf()
 	defer func() {
@@ -732,10 +749,30 @@ func (c *clientConn) readResponse(sv *serverConn, r *Request, rp *Response) (err
 			return RetryError{errors.New("debug retry in readResponse")}
 		}
 	*/
+	done := make(chan int, 1)
+	rspChErr := make(chan error, 1)
 
-	if err = parseResponse(sv, r, rp); err != nil {
-		return c.handleServerReadError(r, sv, err, "parse response")
+	go c.parseResponseDuet(sv, r, rp, done, rspChErr)
+
+	select {
+	case <-done:
+		err = <-rspChErr
+		if err != nil {
+			return c.handleServerReadError(r, sv, err, "parse response")
+		}
+	case <-c.duet:
+		errl.Printf("cli(%s) duet kill\n", c.RemoteAddr())
+		if debug {
+			debug.Printf("close connection to %s remains %d concurrent connections\n",
+				sv.hostPort, decSrvConnCnt(sv.hostPort))
+		}
+		sv.Conn.Close()
+		sv.releaseBuf()
+		return errors.New("killed by duet")
 	}
+	// if err = parseResponse(sv, r, rp); err != nil {
+	// 	return c.handleServerReadError(r, sv, err, "parse response")
+	// }
 	dbgPrintRep(c, r, rp)
 	// After have received the first reponses from the server, we consider
 	// ther server as real instead of fake one caused by wrong DNS reply. So
@@ -1431,14 +1468,14 @@ func sendBodyChunked(w io.Writer, r *bufio.Reader, rdSize int) (err error) {
 			errl.Println("chunk size invalid:", err)
 			return
 		}
-		/*
-			if debug {
-				// To debug getting malformed response status line with "0\r\n".
-				if c, ok := w.(*clientConn); ok {
-					debug.Printf("cli(%s) chunk size %d %#v\n", c.RemoteAddr(), size, string(s))
-				}
+
+		if debug {
+			// To debug getting malformed response status line with "0\r\n".
+			if c, ok := w.(*clientConn); ok {
+				debug.Printf("cli(%s) chunk size %d %#v\n", c.RemoteAddr(), size, string(s))
 			}
-		*/
+		}
+
 		if size == 0 {
 			r.Skip(len(s))
 			if err = skipCRLF(r); err != nil {
